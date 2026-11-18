@@ -24,11 +24,16 @@ jobs:
         with:
           python-version: '3.12'
           activate-environment: true
+      - uses: actions/checkout@v4
+        with:
+          repository: des-intelli/mlx-vlm
+          ref: ee0e0ef37b4bfbebcfe1d29eeb4bc480663db9aa
+          path: .model-source
       - name: Install the matching model implementation
         run: >-
           uv pip install
           'mlx==0.32.4' 'mlx-lm==0.32.2' pytest pytest-asyncio
-          'mlx-vlm @ git+https://github.com/des-intelli/mlx-vlm@ee0e0ef37b4bfbebcfe1d29eeb4bc480663db9aa'
+          -e .model-source
       - name: Check snapshot isolation, budgets and continuation
         run: |
           python - <<'PY'
