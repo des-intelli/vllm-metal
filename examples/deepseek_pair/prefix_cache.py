@@ -88,6 +88,7 @@ class PrefixStore:
         self.nocache = nocache
         self.memory = OrderedDict()
         self.disk = OrderedDict()
+        self.invalid = set()
         self.memory_bytes = self.disk_bytes = 0
         if disk_bytes:
             self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -118,7 +119,8 @@ class PrefixStore:
         return [
             tuple(key)
             for key in candidates
-            if tuple(key) in self.memory or tuple(key) in self.disk
+            if tuple(key) in self.memory
+            or (tuple(key) in self.disk and tuple(key) not in self.invalid)
         ]
 
     def _remember(self, key, snapshot):
@@ -135,9 +137,10 @@ class PrefixStore:
 
     def _evict_disk(self, incoming):
         while self.disk and self.disk_bytes + incoming > self.disk_limit:
-            key, size = self.disk.popitem(last=False)
+            key = next(iter(self.disk))
             self._path(key).unlink(missing_ok=True)
-            self.disk_bytes -= size
+            self.disk_bytes -= self.disk.pop(key)
+            self.invalid.discard(key)
 
     def put(self, key, cache):
         key = tuple(key)
@@ -145,7 +148,11 @@ class PrefixStore:
             raise ValueError("Prefix length does not match cache offset")
         snapshot = Snapshot.capture(cache)
         self._remember(key, snapshot)
-        if not self.disk_limit or key in self.disk or snapshot.nbytes > self.disk_limit:
+        if (
+            not self.disk_limit
+            or (key in self.disk and key not in self.invalid)
+            or snapshot.nbytes > self.disk_limit
+        ):
             return {"bytes": snapshot.nbytes, "written_bytes": 0, "write_s": 0}
         start = time.monotonic()
         metadata = {
@@ -183,6 +190,8 @@ class PrefixStore:
                 }
             self._evict_disk(size)
             os.replace(temp, self._path(key))
+            self.disk_bytes -= self.disk.pop(key, 0)
+            self.invalid.discard(key)
             self.disk[key] = size
             self.disk_bytes += size
         except OSError as error:
@@ -211,7 +220,7 @@ class PrefixStore:
                 "bytes": snapshot.nbytes,
                 "read_s": time.monotonic() - start,
             }
-        if key not in self.disk:
+        if key not in self.disk or key in self.invalid:
             return None, {"tier": "miss", "read_s": 0}
         path = self._path(key)
         try:
@@ -246,8 +255,9 @@ class PrefixStore:
                 "nocache": self.nocache,
             }
         except (OSError, ValueError, RuntimeError, KeyError) as error:
-            self.disk_bytes -= self.disk.pop(key)
-            path.unlink(missing_ok=True)
+            # Keep accounting for an unreadable file until eviction can remove
+            # it. A read-only or failing disk must not crash active inference.
+            self.invalid.add(key)
             return None, {
                 "tier": "miss",
                 "error": str(error),

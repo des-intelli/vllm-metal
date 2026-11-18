@@ -148,3 +148,26 @@ def test_failed_disk_write_keeps_memory_snapshot_and_removes_partial_file(
     restored, info = store.get(key(), DeepseekV41Cache)
     assert restored.offset == 8 and info["tier"] == "memory"
     assert not list(store.directory.glob(".snapshot-*"))
+
+
+def test_eviction_failure_preserves_disk_accounting(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    store = PrefixStore(tmp_path, "test", memory_bytes=1024**2, disk_bytes=200000)
+    original = cache()
+    original.window[0] = mx.zeros((1, 20000), mx.float32)
+    store.put(key(), original)
+    before = store.disk_bytes
+    target = store._path(key())
+    unlink = Path.unlink
+
+    def fail(path, *args, **kwargs):
+        if path == target:
+            raise OSError("cannot evict")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail)
+    original.offset = 16
+    result = store.put(key(16), original)
+    assert result["write_error"] == "cannot evict"
+    assert store.disk_bytes == before and key() in store.disk
