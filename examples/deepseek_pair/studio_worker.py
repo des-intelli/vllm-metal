@@ -1,4 +1,5 @@
 """vLLM V1 worker for the two-rank DeepSeek V4.1 MLX model."""
+
 import os
 import socket
 import time
@@ -12,6 +13,7 @@ from vllm_metal.v1.worker import MetalWorker
 from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.sampling_batch import SamplingBatch, sample_from_logits
 from shard import ROOT, Shard, send, receive, watch_peer
+
 
 class StudioWorker(MetalWorker):
     def init_device(self):
@@ -52,20 +54,31 @@ class StudioWorker(MetalWorker):
     def get_kv_cache_spec(self):
         # The scheduler accounts for sequence blocks. MLX allocates actual
         # compressed KV and Engram state per request on each rank.
-        return {"deepseek.request_cache": FullAttentionSpec(
-            block_size=self.cache_config.block_size, num_kv_heads=1,
-            head_size=64, dtype=torch.float16)}
+        return {
+            "deepseek.request_cache": FullAttentionSpec(
+                block_size=self.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=64,
+                dtype=torch.float16,
+            )
+        }
 
     def determine_available_memory(self):
         spec = next(iter(self.get_kv_cache_spec().values()))
-        blocks = (self.model_config.max_model_len + spec.block_size - 1) // spec.block_size
+        blocks = (
+            self.model_config.max_model_len + spec.block_size - 1
+        ) // spec.block_size
         return spec.page_size_bytes * (blocks * self.scheduler_config.max_num_seqs + 2)
 
     def initialize_from_config(self, kv_cache_config):
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
 
-    def _forward(self, jobs, drop):
-        command = {"jobs": jobs, "drop": list(drop)}
+    def _forward(self, jobs, drop, sample=None):
+        command = {
+            "jobs": jobs,
+            "drop": list(drop),
+            "sample": [key for key, _ in jobs] if sample is None else sample,
+        }
         send(self.control, command)
         logits = self.shard.forward(command)
         if receive(self.control) != "ok":
@@ -74,6 +87,7 @@ class StudioWorker(MetalWorker):
 
     def compile_or_warm_up_model(self):
         from vllm.v1.worker.worker_base import CompilationTimes
+
         start = time.monotonic()
         self._forward([("warmup", [0, 422])], [])
         self._forward([], ["warmup"])
@@ -86,9 +100,18 @@ class StudioWorker(MetalWorker):
         for req in scheduler_output.scheduled_new_reqs:
             key, params = req.req_id, req.sampling_params
             seed = params.seed
-            generator = None if seed is None else torch.Generator(device="cpu").manual_seed(seed)
-            self.states[key] = dict(prompt=list(req.prompt_token_ids), output=[], pos=0,
-                                    params=params, generator=generator)
+            generator = (
+                None
+                if seed is None
+                else torch.Generator(device="cpu").manual_seed(seed)
+            )
+            self.states[key] = dict(
+                prompt=list(req.prompt_token_ids),
+                output=[],
+                pos=0,
+                params=params,
+                generator=generator,
+            )
             drop.add(key)
         jobs = []
         sample = []
@@ -96,14 +119,14 @@ class StudioWorker(MetalWorker):
             state = self.states[key]
             pos = state["pos"]
             known = state["prompt"] + state["output"]
-            ids = known[pos:pos + count]
+            ids = known[pos : pos + count]
             if len(ids) != count:
                 raise RuntimeError("Inconsistent vLLM schedule for the DeepSeek cache")
             jobs.append((key, ids))
             state["pos"] += count
             if state["pos"] == len(known):
                 sample.append(key)
-        logits = self._forward(jobs, drop) if jobs or drop else {}
+        logits = self._forward(jobs, drop, sample) if jobs or drop else {}
         self.pending = ([key for key, _ in jobs], sample, logits)
         return None
 
@@ -119,14 +142,31 @@ class StudioWorker(MetalWorker):
             states = [self.states[k] for k in sample]
             scores = mx.stack([logits[k] for k in sample])
             if grammar_output is not None:
-                targets = dict(zip(grammar_output.structured_output_request_ids, grammar_output.grammar_bitmask))
+                targets = dict(
+                    zip(
+                        grammar_output.structured_output_request_ids,
+                        grammar_output.grammar_bitmask,
+                    )
+                )
                 for i, key in enumerate(sample):
                     if key in targets:
-                        bits = np.unpackbits(targets[key].view(np.uint8), bitorder="little")[:scores.shape[-1]]
-                        scores[i] = mx.where(mx.array(bits.astype(bool)), scores[i], -float("inf"))
-            batch = SamplingBatch([s["params"] for s in states], [s["prompt"] for s in states],
-                                  [s["output"] for s in states], vocab_size=scores.shape[-1],
-                                  generators={i:s["generator"] for i,s in enumerate(states) if s["generator"] is not None})
+                        bits = np.unpackbits(
+                            targets[key].view(np.uint8), bitorder="little"
+                        )[: scores.shape[-1]]
+                        scores[i] = mx.where(
+                            mx.array(bits.astype(bool)), scores[i], -float("inf")
+                        )
+            batch = SamplingBatch(
+                [s["params"] for s in states],
+                [s["prompt"] for s in states],
+                [s["output"] for s in states],
+                vocab_size=scores.shape[-1],
+                generators={
+                    i: s["generator"]
+                    for i, s in enumerate(states)
+                    if s["generator"] is not None
+                },
+            )
             result = sample_from_logits(scores, batch, self.sampler)
             logprobs = result.logprobs
             for key, token in zip(sample, result.token_ids):
@@ -135,8 +175,12 @@ class StudioWorker(MetalWorker):
         if logprobs is not None and len(sample) != len(keys):
             offsets = list(np.cumsum([0] + [len(row) for row in tokens]))
             logprobs = logprobs._replace(cu_num_generated_tokens=offsets)
-        return ModelRunnerOutput(req_ids=keys, req_id_to_index=rows,
-                                 sampled_token_ids=tokens, logprobs=logprobs)
+        return ModelRunnerOutput(
+            req_ids=keys,
+            req_id_to_index=rows,
+            sampled_token_ids=tokens,
+            logprobs=logprobs,
+        )
 
     def get_model(self):
         return self.shard.lm
