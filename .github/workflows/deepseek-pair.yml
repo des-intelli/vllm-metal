@@ -11,12 +11,16 @@ on:
       - 'examples/deepseek_pair/**'
       - '.github/workflows/deepseek-pair.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   snapshots:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +31,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: des-intelli/mlx-vlm
-          ref: ee0e0ef37b4bfbebcfe1d29eeb4bc480663db9aa
+          ref: 17e1627307f76589858319160a17a692fca381ad
           path: .model-source
       - name: Install the matching model implementation
         run: >-

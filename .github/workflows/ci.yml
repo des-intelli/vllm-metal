@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ main ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     runs-on: ${{ matrix.os }}
@@ -13,7 +17,7 @@ jobs:
       contents: read
     strategy:
       matrix:
-        os: [macos-15]
+        os: [macos-26]
     
     steps:
     - name: Checkout code
@@ -34,7 +38,7 @@ jobs:
       contents: read
     strategy:
       matrix:
-        os: [macos-15]
+        os: [macos-26]
 
     steps:
     - name: Checkout code
