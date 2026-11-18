@@ -51,6 +51,30 @@ def watch_peer(sock):
     threading.Thread(target=check, daemon=True).start()
 
 
+def batch_jobs(jobs, samples):
+    """Combine similar prefill widths with at most 25% padded token work.
+
+    Decode stays separate. Sorting uses only control metadata, so both ranks
+    issue exactly the same collectives without GPU-to-CPU routing reads.
+    """
+    buckets = defaultdict(list)
+    for key, tokens in jobs:
+        if not tokens:
+            raise ValueError("Cannot execute an empty token chunk")
+        buckets[(len(tokens) == 1, key in samples)].append((key, tokens))
+    batches = []
+    for bucket in buckets.values():
+        current = []
+        for item in sorted(bucket, key=lambda item: len(item[1])):
+            if current and len(item[1]) * 4 > len(current[0][1]) * 5:
+                batches.append(current)
+                current = []
+            current.append(item)
+        if current:
+            batches.append(current)
+    return batches
+
+
 class Shard:
     def __init__(self):
         from mlx_vlm.utils import sharded_load
@@ -77,19 +101,21 @@ class Shard:
     def forward(self, message):
         jobs, drop = message["jobs"], set(message["drop"])
         samples = set(message.get("sample", [key for key, _ in jobs]))
-        batches = defaultdict(list)
-        for key, tokens in jobs:
-            batches[(len(tokens), key in samples)].append((key, tokens))
-        groups = {tuple(key for key, _ in batch) for batch in batches.values()}
+        batches = batch_jobs(jobs, samples)
+        groups = {tuple(key for key, _ in batch) for batch in batches}
         for keys in list(self.packed):
             if keys not in groups or drop.intersection(keys):
                 self._unpack(keys)
         for key in drop:
             self.caches.pop(key, None)
         results = {}
-        for batch in batches.values():
+        for batch in batches:
             keys = tuple(key for key, _ in batch)
-            ids = mx.array([tokens for _, tokens in batch])
+            lengths = [len(tokens) for _, tokens in batch]
+            width = max(lengths)
+            ids = mx.array(
+                [[0] * (width - len(tokens)) + tokens for _, tokens in batch]
+            )
             if keys in self.packed:
                 cache = self.packed[keys]
             else:
@@ -101,6 +127,8 @@ class Shard:
                     cache = self.caches[keys[0]] = rows[0]
                 else:
                     cache = self.packed[keys] = rows[0].merge(rows)
+            if any(length != width for length in lengths):
+                cache.prepare_append(lengths)
             keep = 1 if keys[0] in samples else 0
             output = self.lm(ids, cache=[cache], logits_to_keep=keep).logits
             if keep:
