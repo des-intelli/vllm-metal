@@ -26,3 +26,46 @@ by this adapter. This example supports generation only.
 
 Distribute pinned source artifacts over existing SSH. Public read-only GitHub
 clones need no key; never place developer write credentials on serving nodes.
+
+## Request-prefix snapshots and SSD tier
+
+Set `DEEPSEEK_PREFIX_CACHE=1` on **both** ranks to enable the adapter's own
+prefix store. It snapshots compressed KV buffers, sliding windows, partial
+compression state, Engram history, and cross-layer handoffs immediately before
+the final prompt token. Snapshots use exact token-ID hashes. Only prefixes
+successfully restored on both ranks are reused; missing or unreadable entries
+fall back to normal prefill. The last prompt token is always evaluated to obtain
+fresh logits. Separate request copies protect snapshots from later mutation.
+
+Configure each rank with:
+
+- `DEEPSEEK_PREFIX_MEMORY_BYTES`: RAM LRU budget (default 2 GiB).
+- `DEEPSEEK_PREFIX_DISK_BYTES`: SSD budget (default zero, disabled).
+- `DEEPSEEK_PREFIX_DIR`: service-owned cache directory.
+- `DEEPSEEK_PREFIX_NOCACHE=1`: request Darwin `F_NOCACHE` for disk reads during
+  I/O experiments. This is not a global filesystem-cache purge or proof of a
+  physically cold SSD read.
+
+Budgets apply separately per rank and model/source identity. Old identities
+remain in separate directories for explicit cleanup. Do not run multiple
+writers against one rank's cache directory. Checkpoint files must be immutable
+while serving; identity includes configuration/tokenizer bytes, weight-file
+sizes and modification times, model source and MLX version. Files contain tensor
+data in safetensors format and are created with owner-only permissions. Writes
+are synchronous and atomic. `prefix_save` records their bytes and latency;
+`prefix_restore` records the tier and read time. `prefix_hit` records tokens
+actually reused after both-rank confirmation.
+
+Keep the vLLM `--no-enable-prefix-caching` flag: scheduler blocks are still
+virtual accounting objects. Cached prompt positions advance through normal
+scheduler steps without model execution. Consequently standard vLLM cached-token
+metrics do not describe this store; use the adapter's prefix events. Prefix
+caching is opt-in, intended for this private experimental service. It does not
+implement a general distributed vLLM cache connector.
+
+Run snapshot, disk, branch-isolation and continuation tests against the matching
+MLX VLM source checkout with:
+
+```sh
+python -m pytest -q examples/deepseek_pair/test_prefix_cache.py
+```

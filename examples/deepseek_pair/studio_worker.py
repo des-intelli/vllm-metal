@@ -7,12 +7,14 @@ import time
 import mlx.core as mx
 import numpy as np
 import torch
+from prefix_cache import prefix_keys
+from shard import ROOT, Shard, receive, send, watch_peer
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm_metal.v1.worker import MetalWorker
+
 from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.sampling_batch import SamplingBatch, sample_from_logits
-from shard import ROOT, Shard, send, receive, watch_peer
+from vllm_metal.v1.worker import MetalWorker
 
 
 class StudioWorker(MetalWorker):
@@ -42,8 +44,14 @@ class StudioWorker(MetalWorker):
             raise RuntimeError("Peer authentication failed")
         watch_peer(self.link)
         self.shard = Shard()
-        if receive(self.control) != "ready":
-            raise RuntimeError("Peer failed to load the checkpoint")
+        expected = {
+            "status": "ready",
+            "protocol": 2,
+            "signature": self.shard.runtime_signature,
+            "prefix_enabled": self.shard.prefix_enabled,
+        }
+        if receive(self.control) != expected:
+            raise RuntimeError("Peer runtime source or prefix configuration differs")
         self.states = {}
         self.sampler = Sampler()
         self.pending = None
@@ -73,17 +81,56 @@ class StudioWorker(MetalWorker):
     def initialize_from_config(self, kv_cache_config):
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
 
-    def _forward(self, jobs, drop, sample=None):
+    def _forward(self, jobs, drop, sample=None, save=None):
         command = {
             "jobs": jobs,
             "drop": list(drop),
             "sample": [key for key, _ in jobs] if sample is None else sample,
+            "save": {} if save is None else save,
         }
         send(self.control, command)
         logits = self.shard.forward(command)
         if receive(self.control) != "ok":
             raise RuntimeError("Peer did not finish the model step")
         return logits
+
+    def _prepare_prefixes(self, new_keys, drop):
+        store = self.shard.prefix_store
+        candidates = {}
+        for key in new_keys:
+            state = self.states[key]
+            prompt = state["prompt"]
+            if len(prompt) <= 1024:
+                continue
+            checkpoint = len(prompt) - 1
+            choices = prefix_keys(prompt, store.lengths | {checkpoint})
+            candidates[key] = choices
+            state["checkpoint"] = choices[-1]
+        command = {"op": "probe", "drop": list(drop), "candidates": candidates}
+        send(self.control, command)
+        local = self.shard.probe(command)
+        peer = receive(self.control)
+        selected = {}
+        for key, choices in local.items():
+            common = set(map(tuple, choices)) & set(map(tuple, peer.get(key, [])))
+            if common:
+                selected[key] = max(common, key=lambda item: item[1])
+        if not selected:
+            return set()
+        send(self.control, {"op": "restore", "selected": selected})
+        local_ok = self.shard.restore(selected)
+        peer_ok = receive(self.control)
+        failed = set()
+        for key, prefix in selected.items():
+            if local_ok[key] and peer_ok.get(key):
+                self.states[key]["reused"] = prefix[1]
+                self.shard._prefix_event(
+                    "prefix_hit", request=key, reused_tokens=prefix[1]
+                )
+            else:
+                failed.add(key)
+        # Drop BOTH rank copies on any restore failure before model execution.
+        return failed
 
     def compile_or_warm_up_model(self):
         from vllm.v1.worker.worker_base import CompilationTimes
@@ -97,6 +144,7 @@ class StudioWorker(MetalWorker):
         drop = set(scheduler_output.finished_req_ids)
         for key in drop:
             self.states.pop(key, None)
+        new_keys = []
         for req in scheduler_output.scheduled_new_reqs:
             key, params = req.req_id, req.sampling_params
             seed = params.seed
@@ -105,29 +153,50 @@ class StudioWorker(MetalWorker):
                 if seed is None
                 else torch.Generator(device="cpu").manual_seed(seed)
             )
-            self.states[key] = dict(
-                prompt=list(req.prompt_token_ids),
-                output=[],
-                pos=0,
-                params=params,
-                generator=generator,
-            )
+            self.states[key] = {
+                "prompt": list(req.prompt_token_ids),
+                "output": [],
+                "pos": 0,
+                "params": params,
+                "generator": generator,
+                "reused": 0,
+                "checkpoint": None,
+            }
+            new_keys.append(key)
             drop.add(key)
-        jobs = []
-        sample = []
+        if self.shard.prefix_enabled and new_keys:
+            drop = self._prepare_prefixes(new_keys, drop)
+        jobs, tails, sample, save = [], [], [], {}
+        keys = list(scheduler_output.num_scheduled_tokens)
         for key, count in scheduler_output.num_scheduled_tokens.items():
             state = self.states[key]
             pos = state["pos"]
             known = state["prompt"] + state["output"]
-            ids = known[pos : pos + count]
-            if len(ids) != count:
+            end = pos + count
+            if end > len(known):
                 raise RuntimeError("Inconsistent vLLM schedule for the DeepSeek cache")
-            jobs.append((key, ids))
-            state["pos"] += count
-            if state["pos"] == len(known):
+            start = max(pos, state["reused"])
+            checkpoint = state["checkpoint"]
+            if start < end:
+                if checkpoint is not None and start < checkpoint[1] <= end:
+                    split = checkpoint[1]
+                    jobs.append((key, known[start:split]))
+                    save[key] = checkpoint
+                    if split < end:
+                        tails.append((key, known[split:end]))
+                else:
+                    jobs.append((key, known[start:end]))
+            state["pos"] = end
+            if end == len(known):
                 sample.append(key)
-        logits = self._forward(jobs, drop, sample) if jobs or drop else {}
-        self.pending = ([key for key, _ in jobs], sample, logits)
+        tail_keys = {key for key, _ in tails}
+        first_sample = [key for key in sample if key not in tail_keys]
+        logits = self._forward(jobs, drop, first_sample, save) if jobs or drop else {}
+        if tails:
+            logits.update(
+                self._forward(tails, [], [key for key in sample if key in tail_keys])
+            )
+        self.pending = (keys, sample, logits)
         return None
 
     def sample_tokens(self, grammar_output):
@@ -146,6 +215,7 @@ class StudioWorker(MetalWorker):
                     zip(
                         grammar_output.structured_output_request_ids,
                         grammar_output.grammar_bitmask,
+                        strict=True,
                     )
                 )
                 for i, key in enumerate(sample):
@@ -169,7 +239,7 @@ class StudioWorker(MetalWorker):
             )
             result = sample_from_logits(scores, batch, self.sampler)
             logprobs = result.logprobs
-            for key, token in zip(sample, result.token_ids):
+            for key, token in zip(sample, result.token_ids, strict=True):
                 self.states[key]["output"].append(token)
                 tokens[rows[key]] = [token]
         if logprobs is not None and len(sample) != len(keys):

@@ -1,12 +1,17 @@
 """Model execution shared by the vLLM Metal worker and the second Mac."""
 
+import hashlib
 import hmac
+import inspect
 import json
 import os
+import socket
+import time
 from collections import defaultdict
 from pathlib import Path
-import socket
+
 import mlx.core as mx
+from prefix_cache import PrefixStore, model_identity
 
 ROOT = Path(os.environ.get("DEEPSEEK_CLUSTER_ROOT", Path.home() / "vllm-cluster"))
 MODEL = Path(
@@ -28,7 +33,8 @@ def receive(stream):
 
 def watch_peer(sock):
     """Exit a disconnected rank even if MLX is blocked inside a collective."""
-    import select, threading
+    import select
+    import threading
     from contextlib import closing
 
     def check():
@@ -91,12 +97,91 @@ class Shard:
             raise RuntimeError("Engram hash initialization failed")
         self.caches = {}
         self.packed = {}
+        source = Path(inspect.getfile(type(self.lm))).parent
+        signature = hashlib.sha256()
+        for path in [
+            *(
+                source / name
+                for name in (
+                    "language.py",
+                    "fakequant.py",
+                    "engram.py",
+                    "sparse_attention.py",
+                )
+            ),
+            *(
+                Path(__file__).with_name(name)
+                for name in ("shard.py", "studio_worker.py", "prefix_cache.py")
+            ),
+        ]:
+            signature.update(path.read_bytes())
+        self.runtime_signature = signature.hexdigest()
+        self.prefix_enabled = os.environ.get("DEEPSEEK_PREFIX_CACHE", "0") == "1"
+        self.prefix_store = None
+        if self.prefix_enabled:
+            source = Path(inspect.getfile(type(self.lm))).parent
+            self.prefix_store = PrefixStore(
+                Path(os.environ.get("DEEPSEEK_PREFIX_DIR", ROOT / "prefix-cache"))
+                / str(self.group.rank()),
+                model_identity(MODEL, source),
+                memory_bytes=int(
+                    os.environ.get("DEEPSEEK_PREFIX_MEMORY_BYTES", str(2 * 1024**3))
+                ),
+                disk_bytes=int(os.environ.get("DEEPSEEK_PREFIX_DISK_BYTES", "0")),
+                nocache=os.environ.get("DEEPSEEK_PREFIX_NOCACHE", "0") == "1",
+            )
         print("Loaded DeepSeek-V4.1-Flash-1017 rank", self.group.rank(), flush=True)
 
     def _unpack(self, keys):
         cache = self.packed.pop(keys)
         for i, key in enumerate(keys):
             self.caches[key] = cache.extract(i)
+
+    def _prefix_event(self, event, **fields):
+        print(
+            json.dumps(
+                dict(event=event, epoch=time.time(), rank=self.group.rank(), **fields)
+            ),
+            flush=True,
+        )
+
+    def drop_requests(self, keys):
+        keys = set(keys)
+        for group in list(self.packed):
+            if keys.intersection(group):
+                self._unpack(group)
+        for key in keys:
+            self.caches.pop(key, None)
+
+    def probe(self, message):
+        self.drop_requests(message["drop"])
+        return {
+            key: self.prefix_store.available(candidates) if self.prefix_store else []
+            for key, candidates in message["candidates"].items()
+        }
+
+    def restore(self, selected):
+        results = {}
+        cache_type = type(self.lm.make_cache()[0])
+        for key, prefix in selected.items():
+            cache, info = self.prefix_store.get(prefix, cache_type)
+            if cache is not None:
+                self.caches[key] = cache
+            results[key] = cache is not None
+            self._prefix_event("prefix_restore", request=key, tokens=prefix[1], **info)
+        return results
+
+    def _save_prefix(self, key, prefix):
+        cache = self.caches.get(key)
+        if cache is None:
+            for group, packed in self.packed.items():
+                if key in group:
+                    cache = packed.extract(group.index(key))
+                    break
+        if cache is None:
+            raise RuntimeError("Cannot snapshot an absent request")
+        info = self.prefix_store.put(prefix, cache)
+        self._prefix_event("prefix_save", request=key, tokens=prefix[1], **info)
 
     def forward(self, message):
         jobs, drop = message["jobs"], set(message["drop"])
@@ -134,7 +219,9 @@ class Shard:
             if keep:
                 logits = output[:, -1, :]
                 mx.eval(logits)
-                results.update(zip(keys, logits))
+                results.update(zip(keys, logits, strict=True))
+        for key, prefix in message.get("save", {}).items():
+            self._save_prefix(key, prefix)
         return results
 
 
@@ -157,14 +244,30 @@ def follow():
                     send(stream, "ok")
                     watch_peer(conn)
                     model = Shard()
-                    send(stream, "ready")
+                    send(
+                        stream,
+                        {
+                            "status": "ready",
+                            "protocol": 2,
+                            "signature": model.runtime_signature,
+                            "prefix_enabled": model.prefix_enabled,
+                        },
+                    )
                     while True:
                         try:
                             command = receive(stream)
                         except ConnectionError:
                             return
-                        model.forward(command)
-                        send(stream, "ok")
+                        operation = command.get("op", "forward")
+                        if operation == "probe":
+                            send(stream, model.probe(command))
+                        elif operation == "restore":
+                            send(stream, model.restore(command["selected"]))
+                        elif operation == "forward":
+                            model.forward(command)
+                            send(stream, "ok")
+                        else:
+                            raise ValueError(f"Unknown peer operation: {operation}")
 
 
 if __name__ == "__main__":
