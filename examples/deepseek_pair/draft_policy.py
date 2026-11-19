@@ -5,9 +5,14 @@ from dataclasses import dataclass
 
 @dataclass
 class _Cost:
-    seconds_per_token: float
+    mean_seconds: float
+    mean_tokens: float
     samples: int
     last_step: int
+
+    @property
+    def seconds_per_token(self):
+        return self.mean_seconds / self.mean_tokens
 
 
 class DraftWidthPolicy:
@@ -21,17 +26,16 @@ class DraftWidthPolicy:
             return
         step = self.steps[batch] = self.steps.get(batch, 0) + 1
         table = self.costs.setdefault(batch, {})
-        value = seconds / emitted
         if width not in table:
-            table[width] = _Cost(value, 1, step)
+            table[width] = _Cost(seconds, emitted, 1, step)
         else:
             cost = table[width]
             cost.samples += 1
-            # Early observations include compilation and cache warm-up. Keep
-            # adapting as prompt mix and the number of accepted tokens change.
-            cost.seconds_per_token += (value - cost.seconds_per_token) / min(
-                cost.samples, 12
-            )
+            # Estimate throughput over the same recency-weighted steps. Averaging
+            # seconds per token directly overweights steps that reject drafts.
+            window = min(cost.samples, 12)
+            cost.mean_seconds += (seconds - cost.mean_seconds) / window
+            cost.mean_tokens += (emitted - cost.mean_tokens) / window
             cost.last_step = step
 
     def choose(self, batch):

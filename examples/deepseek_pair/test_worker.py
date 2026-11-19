@@ -72,6 +72,16 @@ class TestWorkerVerification(unittest.TestCase):
             )
         self.assertEqual(policy.choose(8), 2)
 
+    def test_adaptive_width_maximizes_tokens_over_elapsed_time(self):
+        policy = DraftWidthPolicy(5)
+        for accepted_output in (1, 3, 1, 3):
+            policy.observe(1, 0, 0.12, 1)
+            policy.observe(1, 2, 0.20, accepted_output)
+            policy.observe(1, 5, 0.60, 3)
+        # Width two emits eight tokens in 0.8 seconds, ahead of ordinary
+        # decoding at one token per 0.12 seconds despite two rejected drafts.
+        self.assertEqual(policy.choose(1), 2)
+
     def worker(self, params):
         worker = object.__new__(StudioWorker)
         worker.states = {
