@@ -443,13 +443,15 @@ class StudioWorker(MetalWorker):
                     continue
                 values = logits[key][None]
             start = len(flat)
-            for index, value in enumerate(values):
-                if key not in verified and state["generator"] is not None:
-                    generators[len(flat)] = state["generator"]
-                flat.append(value)
-                params.append(state["params"])
-                prompts.append(state["prompt"])
-                outputs.append(state["output"] + list(drafts.get(key, []))[:index])
+            flat.extend(values)
+            # Rank-local candidates already include everything required for greedy sampling.
+            if self.candidate_k is None:
+                for index in range(len(values)):
+                    if key not in verified and state["generator"] is not None:
+                        generators[start + index] = state["generator"]
+                    params.append(state["params"])
+                    prompts.append(state["prompt"])
+                    outputs.append(state["output"] + list(drafts.get(key, []))[:index])
             spans[key] = (start, len(flat))
         scores = mx.stack(flat)
         token_ids, logprobs = self._sample_rows(
