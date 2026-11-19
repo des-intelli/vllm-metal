@@ -63,6 +63,28 @@ metrics do not describe this store; use the adapter's prefix events. Prefix
 caching is opt-in, intended for this private experimental service. It does not
 implement a general distributed vLLM cache connector.
 
+### Reusing generated answers and edited conversations
+
+Set `DEEPSEEK_PREFIX_DECODE_END=1` on both ranks to snapshot completed or
+cancelled requests before releasing their state. The snapshot covers only
+tokens already evaluated by the model: the last sampled token is evaluated
+again on the next request. This lets an agent reuse its previous answer in
+addition to its input prompt. It does not retain cancelled work that has not
+been evaluated, or work lost when the server process exits.
+
+`DEEPSEEK_PREFIX_STRIDE=1024` additionally saves intermediate checkpoints at
+scheduler boundaries after at least 1024 new computed tokens. An edited or
+branched conversation can restore the longest stored exact prefix shared by
+both ranks, then evaluate its remaining suffix. This is checkpoint-based
+reuse, not arbitrary rewind of a later snapshot; scheduler chunk sizes affect
+checkpoint spacing. Set the stride to zero (the default) for completion-only
+snapshots. Both options require `DEEPSEEK_PREFIX_CACHE=1`.
+
+The existing RAM and SSD budgets bound these additional snapshots. SSD writes
+remain synchronous, so measure their cost against follow-up TTFT and avoid
+overly frequent checkpoints. Checkpoints share the existing LRU with prompts.
+Both ranks negotiate the same feature configuration at startup (protocol 3).
+
 Run snapshot, disk, branch-isolation and continuation tests against the matching
 MLX VLM source checkout with:
 

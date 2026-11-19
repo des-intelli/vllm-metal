@@ -117,6 +117,16 @@ class Shard:
             signature.update(path.read_bytes())
         self.runtime_signature = signature.hexdigest()
         self.prefix_enabled = os.environ.get("DEEPSEEK_PREFIX_CACHE", "0") == "1"
+        self.prefix_decode_end = self.prefix_enabled and (
+            os.environ.get("DEEPSEEK_PREFIX_DECODE_END", "0") == "1"
+        )
+        self.prefix_stride = int(os.environ.get("DEEPSEEK_PREFIX_STRIDE", "0"))
+        if self.prefix_stride < 0:
+            raise ValueError("Prefix checkpoint stride must be nonnegative")
+        self.runtime_features = {
+            "decode_end": self.prefix_decode_end,
+            "stride": self.prefix_stride,
+        }
         self.prefix_store = None
         if self.prefix_enabled:
             source = Path(inspect.getfile(type(self.lm))).parent
@@ -183,6 +193,10 @@ class Shard:
         info = self.prefix_store.put(prefix, cache)
         self._prefix_event("prefix_save", request=key, tokens=prefix[1], **info)
 
+    def snapshot_requests(self, prefixes):
+        for key, prefix in prefixes.items():
+            self._save_prefix(key, prefix)
+
     def forward(self, message):
         jobs, drop = message["jobs"], set(message["drop"])
         samples = set(message.get("sample", [key for key, _ in jobs]))
@@ -248,9 +262,10 @@ def follow():
                         stream,
                         {
                             "status": "ready",
-                            "protocol": 2,
+                            "protocol": 3,
                             "signature": model.runtime_signature,
                             "prefix_enabled": model.prefix_enabled,
+                            "features": model.runtime_features,
                         },
                     )
                     while True:
@@ -265,6 +280,9 @@ def follow():
                             send(stream, model.restore(command["selected"]))
                         elif operation == "forward":
                             model.forward(command)
+                            send(stream, "ok")
+                        elif operation == "snapshot":
+                            model.snapshot_requests(command["prefixes"])
                             send(stream, "ok")
                         else:
                             raise ValueError(f"Unknown peer operation: {operation}")

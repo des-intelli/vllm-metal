@@ -37,9 +37,10 @@ class Snapshot:
         )
 
 
-def prefix_keys(tokens, lengths):
+def prefix_keys(tokens, lengths, *, include_full=False):
     """Hash exact token IDs incrementally; no decoded-text equivalence."""
-    wanted = {int(n) for n in lengths if 0 < n < len(tokens)}
+    limit = len(tokens) + int(include_full)
+    wanted = {int(n) for n in lengths if 0 < n < limit}
     result = []
     digest = hashlib.sha256()
     for i, token in enumerate(tokens[: max(wanted, default=0)], 1):
@@ -47,6 +48,27 @@ def prefix_keys(tokens, lengths):
         if i in wanted:
             result.append((digest.hexdigest(), i))
     return result
+
+
+def request_snapshots(states, keys, *, stride=0, finished=False):
+    """Select only computed tokens; a sampled tail has no corresponding KV."""
+    prefixes = {}
+    for key in keys:
+        state = states.get(key)
+        if state is None:
+            continue
+        pos = state["pos"]
+        saved = state.get("saved_offset", 0)
+        if pos <= max(1024, saved, state["reused"]):
+            continue
+        if not finished and (not stride or pos - saved < stride):
+            continue
+        known = state["prompt"] + state["output"]
+        choices = prefix_keys(known, [pos], include_full=True)
+        if not choices:
+            raise ValueError("Computed position exceeds the request token history")
+        prefixes[key] = choices[0]
+    return prefixes
 
 
 def model_identity(model_path, source_path):

@@ -7,7 +7,7 @@ import time
 import mlx.core as mx
 import numpy as np
 import torch
-from prefix_cache import prefix_keys
+from prefix_cache import prefix_keys, request_snapshots
 from shard import ROOT, Shard, receive, send, watch_peer
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import ModelRunnerOutput
@@ -46,9 +46,10 @@ class StudioWorker(MetalWorker):
         self.shard = Shard()
         expected = {
             "status": "ready",
-            "protocol": 2,
+            "protocol": 3,
             "signature": self.shard.runtime_signature,
             "prefix_enabled": self.shard.prefix_enabled,
+            "features": self.shard.runtime_features,
         }
         if receive(self.control) != expected:
             raise RuntimeError("Peer runtime source or prefix configuration differs")
@@ -132,6 +133,21 @@ class StudioWorker(MetalWorker):
         # Drop BOTH rank copies on any restore failure before model execution.
         return failed
 
+    def _snapshot_requests(self, keys, *, finished=False):
+        if not self.shard.prefix_decode_end:
+            return
+        prefixes = request_snapshots(
+            self.states, keys, stride=self.shard.prefix_stride, finished=finished
+        )
+        if not prefixes:
+            return
+        send(self.control, {"op": "snapshot", "prefixes": prefixes})
+        self.shard.snapshot_requests(prefixes)
+        if receive(self.control) != "ok":
+            raise RuntimeError("Peer did not finish request snapshots")
+        for key, prefix in prefixes.items():
+            self.states[key]["saved_offset"] = prefix[1]
+
     def compile_or_warm_up_model(self):
         from vllm.v1.worker.worker_base import CompilationTimes
 
@@ -142,6 +158,9 @@ class StudioWorker(MetalWorker):
 
     def execute_model(self, scheduler_output):
         drop = set(scheduler_output.finished_req_ids)
+        # Cache offset excludes the last sampled token, which has not been
+        # evaluated. Save that exact processed prefix on completion or cancel.
+        self._snapshot_requests(drop, finished=True)
         for key in drop:
             self.states.pop(key, None)
         new_keys = []
@@ -161,6 +180,7 @@ class StudioWorker(MetalWorker):
                 "generator": generator,
                 "reused": 0,
                 "checkpoint": None,
+                "saved_offset": 0,
             }
             new_keys.append(key)
             drop.add(key)
@@ -196,6 +216,9 @@ class StudioWorker(MetalWorker):
             logits.update(
                 self._forward(tails, [], [key for key in sample if key in tail_keys])
             )
+        for key, prefix in save.items():
+            self.states[key]["saved_offset"] = prefix[1]
+        self._snapshot_requests(keys)
         self.pending = (keys, sample, logits)
         return None
 

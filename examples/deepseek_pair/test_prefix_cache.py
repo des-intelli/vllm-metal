@@ -5,7 +5,7 @@ import hashlib
 import mlx.core as mx
 import pytest
 from mlx_vlm.models.deepseek_v41.language import DeepseekV41Cache
-from prefix_cache import PrefixStore, prefix_keys
+from prefix_cache import PrefixStore, prefix_keys, request_snapshots
 
 
 def cache(offset=8):
@@ -86,6 +86,50 @@ def test_exact_token_prefix_hashes_and_offset_validation(tmp_path):
     store = PrefixStore(tmp_path, "test", memory_bytes=1024**2)
     with pytest.raises(ValueError, match="offset"):
         store.put(key(7), cache(8))
+
+
+def test_decode_end_excludes_unprocessed_sample_and_reuses_followup():
+    prompt = list(range(1025))
+    output = [19, 23, 27]
+    state = {
+        "prompt": prompt,
+        "output": output,
+        "pos": 1027,
+        "reused": 0,
+        "saved_offset": 1024,
+    }
+    selected = request_snapshots({"done": state}, ["done", "unknown"], finished=True)
+    checkpoint = selected["done"]
+    assert checkpoint[1] == 1027
+    assert checkpoint in prefix_keys(prompt + output + [99], [1027])
+    assert checkpoint not in prefix_keys(prompt + [19, 91, 27, 99], [1027])
+    # No second snapshot when the same completion is observed again.
+    state["saved_offset"] = checkpoint[1]
+    assert request_snapshots({"done": state}, ["done"], finished=True) == {}
+
+
+def test_checkpoint_stride_and_prefill_cancellation_use_computed_position():
+    state = {
+        "prompt": list(range(4096)),
+        "output": [],
+        "pos": 2048,
+        "reused": 0,
+        "saved_offset": 1024,
+    }
+    assert not request_snapshots({"x": state}, ["x"], stride=2048)
+    checkpoint = request_snapshots({"x": state}, ["x"], stride=1024)["x"]
+    assert checkpoint in prefix_keys(state["prompt"], [2048])
+    assert request_snapshots({"x": state}, ["x"], finished=True)["x"] == checkpoint
+    state["reused"] = 3072
+    assert not request_snapshots({"x": state}, ["x"], finished=True)
+
+
+def test_checkpoint_accepts_fully_evaluated_history_but_lookup_keeps_one_token():
+    ids = list(range(2048))
+    state = {"prompt": ids, "output": [], "pos": 2048, "reused": 0}
+    checkpoint = request_snapshots({"x": state}, ["x"], finished=True)["x"]
+    assert not prefix_keys(ids, [2048])
+    assert checkpoint in prefix_keys(ids + [31], [2048])
 
 
 @pytest.mark.parametrize("disk", [False, True])
