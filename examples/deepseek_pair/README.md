@@ -83,11 +83,44 @@ snapshots. Both options require `DEEPSEEK_PREFIX_CACHE=1`.
 The existing RAM and SSD budgets bound these additional snapshots. SSD writes
 remain synchronous, so measure their cost against follow-up TTFT and avoid
 overly frequent checkpoints. Checkpoints share the existing LRU with prompts.
-Both ranks negotiate the same feature configuration at startup (protocol 3).
+Both ranks negotiate the same feature configuration at startup (protocol 4).
 
 Run snapshot, disk, branch-isolation and continuation tests against the matching
 MLX VLM source checkout with:
 
 ```sh
 python -m pytest -q examples/deepseek_pair/test_prefix_cache.py
+```
+
+## DSpark greedy serving
+
+Set `DEEPSEEK_DSPARK_TOKENS=5` on both ranks and add
+`--speculative-config '{"method":"dspark","num_speculative_tokens":5}'` to
+the leader. The values must match. Zero (the default) disables drafting.
+Use a matching MLX VLM revision that supports block transactions on
+`BatchDeepseekV41Cache`; both ranks check source signatures before serving.
+
+The worker returns proposals to the vLLM scheduler, verifies scheduled blocks
+with the target model, and commits each request's accepted prefix independently.
+It returns accepted tokens plus the target's correction/bonus token, including
+matching logprobs and stop/budget handling. `dspark_verify` events and vLLM's
+speculative metrics report actual verification, rather than just a loaded draft
+model. Requests with nonzero temperature, structured output, or repetition
+detection retain ordinary decoding. Stochastic rejection sampling is not
+implemented by this adapter.
+
+Target prefix snapshots remain enabled. Draft caches are request-local and
+discarded when a request finishes; restored target snapshots do not include
+draft hidden states. The drafter uses the newly evaluated suffix in that case,
+so measure acceptance on cache-hit workloads separately. All emitted tokens
+still pass the target verifier. Drafting runs per request; target verification
+groups requests with equal scheduled block widths. Batch throughput therefore
+needs measurement independently of single-request speedup.
+
+Run the worker's fixed-logit acceptance, stop, logprobs, and mixed-sampling
+regressions in the serving Python environment without loading model weights:
+
+```sh
+TORCH_COMPILE_DISABLE=1 PYTHONPATH=examples/deepseek_pair \
+  python -m unittest discover -s examples/deepseek_pair -p test_worker.py
 ```
