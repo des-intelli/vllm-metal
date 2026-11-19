@@ -10,7 +10,7 @@ import torch
 from prefix_cache import prefix_keys, request_snapshots
 from shard import ROOT, Shard, receive, send, watch_peer
 from vllm.v1.kv_cache_interface import FullAttentionSpec
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, LogprobsLists, ModelRunnerOutput
 
 from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.sampling_batch import SamplingBatch, sample_from_logits
@@ -46,7 +46,7 @@ class StudioWorker(MetalWorker):
         self.shard = Shard()
         expected = {
             "status": "ready",
-            "protocol": 3,
+            "protocol": 4,
             "signature": self.shard.runtime_signature,
             "prefix_enabled": self.shard.prefix_enabled,
             "features": self.shard.runtime_features,
@@ -56,6 +56,21 @@ class StudioWorker(MetalWorker):
         self.states = {}
         self.sampler = Sampler()
         self.pending = None
+        self.draft_token_ids = None
+        spec = self.vllm_config.speculative_config
+        if self.shard.dspark_width:
+            if (
+                spec is None
+                or spec.method != "dspark"
+                or spec.num_speculative_tokens != self.shard.dspark_width
+            ):
+                raise ValueError(
+                    "DSpark requires matching --speculative-config and DEEPSEEK_DSPARK_TOKENS"
+                )
+        elif spec is not None:
+            raise ValueError(
+                "Enable DEEPSEEK_DSPARK_TOKENS on both ranks for speculation"
+            )
 
     def get_supported_tasks(self):
         return ("generate",)
@@ -82,12 +97,18 @@ class StudioWorker(MetalWorker):
     def initialize_from_config(self, kv_cache_config):
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
 
-    def _forward(self, jobs, drop, sample=None, save=None):
+    def _forward(self, jobs, drop, sample=None, save=None, *, speculate=False):
         command = {
             "jobs": jobs,
             "drop": list(drop),
             "sample": [key for key, _ in jobs] if sample is None else sample,
             "save": {} if save is None else save,
+            "speculate": speculate,
+            "draft_keys": [
+                key
+                for key, _ in jobs
+                if key in self.states and self._can_draft(self.states[key]["params"])
+            ],
         }
         send(self.control, command)
         logits = self.shard.forward(command)
@@ -186,12 +207,21 @@ class StudioWorker(MetalWorker):
             drop.add(key)
         if self.shard.prefix_enabled and new_keys:
             drop = self._prepare_prefixes(new_keys, drop)
-        jobs, tails, sample, save = [], [], [], {}
+        jobs, tails, sample, save, verify = [], [], [], {}, []
+        scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
         keys = list(scheduler_output.num_scheduled_tokens)
         for key, count in scheduler_output.num_scheduled_tokens.items():
             state = self.states[key]
             pos = state["pos"]
             known = state["prompt"] + state["output"]
+            drafts = scheduled_drafts.get(key, [])
+            if drafts:
+                if pos != len(known) - 1 or count != len(drafts) + 1:
+                    raise RuntimeError("Inconsistent speculative scheduler positions")
+                if any(token < 0 for token in drafts):
+                    raise RuntimeError("Unresolved speculative placeholder tokens")
+                verify.append((key, [known[-1]] + list(drafts)))
+                continue
             end = pos + count
             if end > len(known):
                 raise RuntimeError("Inconsistent vLLM schedule for the DeepSeek cache")
@@ -218,15 +248,22 @@ class StudioWorker(MetalWorker):
             )
         for key, prefix in save.items():
             self.states[key]["saved_offset"] = prefix[1]
-        self._snapshot_requests(keys)
-        self.pending = (keys, sample, logits)
+        self._snapshot_requests([key for key in keys if key not in scheduled_drafts])
+        verify_start = time.perf_counter()
+        verify_logits = self._forward(verify, [], speculate=True) if verify else {}
+        self.verification_seconds = time.perf_counter() - verify_start
+        self.pending = (keys, sample, logits, verify_logits, scheduled_drafts)
         return None
 
     def sample_tokens(self, grammar_output):
         if self.pending is None:
             return None
-        keys, sample, logits = self.pending
+        keys, sample, logits, verify_logits, drafts = self.pending
         self.pending = None
+        if verify_logits:
+            return self._sample_verification(
+                keys, sample, logits, verify_logits, drafts, grammar_output
+            )
         rows = {key: i for i, key in enumerate(keys)}
         tokens = [[] for _ in keys]
         logprobs = None
@@ -268,10 +305,187 @@ class StudioWorker(MetalWorker):
         if logprobs is not None and len(sample) != len(keys):
             offsets = list(np.cumsum([0] + [len(row) for row in tokens]))
             logprobs = logprobs._replace(cu_num_generated_tokens=offsets)
+        self._propose_drafts(sample)
         return ModelRunnerOutput(
             req_ids=keys,
             req_id_to_index=rows,
             sampled_token_ids=tokens,
+            logprobs=logprobs,
+        )
+
+    @staticmethod
+    def _can_draft(params):
+        # Stochastic verification needs rejection sampling, and structured output
+        # needs a grammar transition per accepted token. Keep their existing path.
+        return (
+            params.temperature < 1e-5
+            and getattr(params, "structured_outputs", None) is None
+            and getattr(params, "repetition_detection", None) is None
+        )
+
+    @staticmethod
+    def _stopped(state):
+        params = state["params"]
+        token = state["output"][-1]
+        return (
+            len(state["output"]) >= params.max_tokens
+            or token == params.eos_token_id
+            or token in (params.stop_token_ids or [])
+        )
+
+    def _propose_drafts(self, keys):
+        self.draft_token_ids = None
+        if not self.shard.dspark_width:
+            return
+        requests, discard = [], []
+        for key in keys:
+            state = self.states[key]
+            params = state["params"]
+            if not self._can_draft(params) or self._stopped(state):
+                discard.append(key)
+                continue
+            remaining = min(
+                params.max_tokens - len(state["output"]),
+                self.model_config.max_model_len
+                - len(state["prompt"])
+                - len(state["output"]),
+            )
+            width = min(self.shard.dspark_width, remaining - 1)
+            if width > 0:
+                requests.append((key, state["output"][-1], width))
+            else:
+                discard.append(key)
+        # Empty requests are sent too, keeping both ranks on the same protocol.
+        send(self.control, {"op": "draft", "requests": requests, "discard": discard})
+        proposals = self.shard.draft_requests(requests, discard)
+        if receive(self.control) != proposals:
+            raise RuntimeError("DSpark ranks produced different drafts")
+        if proposals:
+            self.draft_token_ids = DraftTokenIds(
+                list(proposals), list(proposals.values())
+            )
+
+    def take_draft_token_ids(self):
+        result, self.draft_token_ids = self.draft_token_ids, None
+        return result
+
+    def _sample_verification(
+        self, keys, normal, logits, verified, drafts, grammar_output
+    ):
+        sample_start = time.perf_counter()
+        if grammar_output is not None:
+            # A mixed grammar batch is never drafted by _can_draft. Applying its
+            # single-position masks to normal rows still requires the same mask.
+            targets = dict(
+                zip(
+                    grammar_output.structured_output_request_ids,
+                    grammar_output.grammar_bitmask,
+                    strict=True,
+                )
+            )
+            for key in normal:
+                if key in targets:
+                    bits = np.unpackbits(
+                        targets[key].view(np.uint8), bitorder="little"
+                    )[: logits[key].shape[-1]]
+                    logits[key] = mx.where(
+                        mx.array(bits.astype(bool)), logits[key], -float("inf")
+                    )
+        flat, params, prompts, outputs, spans = [], [], [], [], {}
+        generators = {}
+        for key in keys:
+            state = self.states[key]
+            values = verified.get(key)
+            if values is None:
+                if key not in normal:
+                    continue
+                values = logits[key][None]
+            start = len(flat)
+            for index, value in enumerate(values):
+                if key not in verified and state["generator"] is not None:
+                    generators[len(flat)] = state["generator"]
+                flat.append(value)
+                params.append(state["params"])
+                prompts.append(state["prompt"])
+                outputs.append(state["output"] + list(drafts.get(key, []))[:index])
+            spans[key] = (start, len(flat))
+        scores = mx.stack(flat)
+        result = sample_from_logits(
+            scores,
+            SamplingBatch(
+                params,
+                prompts,
+                outputs,
+                vocab_size=scores.shape[-1],
+                generators=generators,
+            ),
+            self.sampler,
+        )
+        generated, lengths, selected = [], {}, []
+        for key in keys:
+            if key not in spans:
+                generated.append([])
+                continue
+            start, end = spans[key]
+            choices = result.token_ids[start:end]
+            if key in verified:
+                accepted = 0
+                for proposal, target in zip(drafts[key], choices, strict=False):
+                    if proposal != target:
+                        break
+                    accepted += 1
+                emitted = list(drafts[key][:accepted]) + [choices[accepted]]
+            else:
+                emitted = choices
+            state = self.states[key]
+            actual = []
+            for token in emitted:
+                state["output"].append(token)
+                actual.append(token)
+                if self._stopped(state):
+                    break
+            if key in verified:
+                lengths[key] = len(actual)
+                state["pos"] += len(actual)
+                self.shard._prefix_event(
+                    "dspark_verify",
+                    request=key,
+                    drafted=len(drafts[key]),
+                    accepted=len(actual) - 1,
+                    emitted=len(actual),
+                )
+            generated.append(actual)
+            selected.extend(range(start, start + len(actual)))
+        sample_seconds = time.perf_counter() - sample_start
+        commit_start = time.perf_counter()
+        send(self.control, {"op": "commit", "lengths": lengths})
+        self.shard.commit_verification(lengths)
+        if receive(self.control) != "ok":
+            raise RuntimeError("Peer did not commit verification")
+        self._snapshot_requests(list(lengths))
+        commit_seconds = time.perf_counter() - commit_start
+        logprobs = result.logprobs
+        if logprobs is not None:
+            logprobs = LogprobsLists(
+                logprobs.logprob_token_ids[selected],
+                logprobs.logprobs[selected],
+                logprobs.sampled_token_ranks[selected],
+                list(np.cumsum([0] + [len(row) for row in generated])),
+            )
+        draft_start = time.perf_counter()
+        self._propose_drafts(list(spans))
+        self.shard._prefix_event(
+            "dspark_step",
+            requests=len(lengths),
+            verify_s=getattr(self, "verification_seconds", 0),
+            sample_s=sample_seconds,
+            commit_s=commit_seconds,
+            draft_s=time.perf_counter() - draft_start,
+        )
+        return ModelRunnerOutput(
+            req_ids=keys,
+            req_id_to_index={key: i for i, key in enumerate(keys)},
+            sampled_token_ids=generated,
             logprobs=logprobs,
         )
 

@@ -97,6 +97,21 @@ class Shard:
             raise RuntimeError("Engram hash initialization failed")
         self.caches = {}
         self.packed = {}
+        self.dspark_width = int(os.environ.get("DEEPSEEK_DSPARK_TOKENS", "0"))
+        if not 0 <= self.dspark_width <= 16:
+            raise ValueError("DEEPSEEK_DSPARK_TOKENS must be between zero and 16")
+        self.draft = None
+        self.draft_caches = {}
+        self.draft_hidden = {}
+        self.verification = {}
+        if self.dspark_width:
+            from mlx_vlm.speculative.drafters.deepseek_v41_dspark.split import (
+                DeepseekV41DsparkSplitter,
+            )
+
+            self.draft = DeepseekV41DsparkSplitter().load(MODEL)
+            self.draft.bind(self.lm)
+            mx.eval(self.draft.parameters())
         source = Path(inspect.getfile(type(self.lm))).parent
         signature = hashlib.sha256()
         for path in [
@@ -126,6 +141,7 @@ class Shard:
         self.runtime_features = {
             "decode_end": self.prefix_decode_end,
             "stride": self.prefix_stride,
+            "dspark_tokens": self.dspark_width,
         }
         self.prefix_store = None
         if self.prefix_enabled:
@@ -162,6 +178,42 @@ class Shard:
                 self._unpack(group)
         for key in keys:
             self.caches.pop(key, None)
+            self.draft_caches.pop(key, None)
+            self.draft_hidden.pop(key, None)
+
+    def draft_requests(self, requests, discard=()):
+        if self.draft is None:
+            raise RuntimeError("DSpark is not enabled")
+        result = {}
+        for key in discard:
+            self.draft_hidden.pop(key, None)
+        for key, anchor, width in requests:
+            if not 0 < width <= self.dspark_width:
+                raise ValueError("Draft width exceeds the configured maximum")
+            hidden = mx.concatenate(self.draft_hidden.pop(key), axis=1)
+            if key not in self.draft_caches:
+                self.draft_caches[key] = self.draft.make_cache()
+            proposals = self.draft.draft_block(
+                anchor,
+                hidden,
+                self.draft_caches[key],
+                width + 1,
+                lambda logits: mx.argmax(logits, axis=-1),
+            )
+            result[key] = proposals.tolist()[0]
+        return result
+
+    def commit_verification(self, lengths):
+        expected = {key for keys in self.verification for key in keys}
+        if set(lengths) != expected:
+            raise ValueError("Expected one commit length per verified request")
+        for keys, (cache, generation, _) in self.verification.items():
+            cache.validate_speculation([lengths[key] for key in keys], generation)
+        for keys, (cache, generation, hidden) in self.verification.items():
+            cache.commit_speculation([lengths[key] for key in keys], generation)
+            for index, key in enumerate(keys):
+                self.draft_hidden[key] = [hidden[index : index + 1, : lengths[key]]]
+        self.verification.clear()
 
     def probe(self, message):
         self.drop_requests(message["drop"])
@@ -198,15 +250,29 @@ class Shard:
             self._save_prefix(key, prefix)
 
     def forward(self, message):
+        if self.verification:
+            raise RuntimeError("Commit the preceding verification before forwarding")
         jobs, drop = message["jobs"], set(message["drop"])
         samples = set(message.get("sample", [key for key, _ in jobs]))
-        batches = batch_jobs(jobs, samples)
+        speculate = message.get("speculate", False)
+        draft_keys = set(message.get("draft_keys", ())) if self.draft else set()
+        if speculate:
+            if self.draft is None:
+                raise RuntimeError("DSpark is not enabled")
+            by_width = defaultdict(list)
+            for job in jobs:
+                by_width[len(job[1])].append(job)
+            batches = list(by_width.values())
+        else:
+            batches = batch_jobs(jobs, samples)
         groups = {tuple(key for key, _ in batch) for batch in batches}
         for keys in list(self.packed):
             if keys not in groups or drop.intersection(keys):
                 self._unpack(keys)
         for key in drop:
             self.caches.pop(key, None)
+            self.draft_caches.pop(key, None)
+            self.draft_hidden.pop(key, None)
         results = {}
         for batch in batches:
             keys = tuple(key for key, _ in batch)
@@ -228,10 +294,30 @@ class Shard:
                     cache = self.packed[keys] = rows[0].merge(rows)
             if any(length != width for length in lengths):
                 cache.prepare_append(lengths)
-            keep = 1 if keys[0] in samples else 0
-            output = self.lm(ids, cache=[cache], logits_to_keep=keep).logits
-            if keep:
-                logits = output[:, -1, :]
+            keep = None if speculate else (1 if keys[0] in samples else 0)
+            if speculate:
+                generation = cache.start_speculation(width, block=True)
+            capture = speculate or bool(draft_keys.intersection(keys))
+            kwargs = (
+                {}
+                if not capture
+                else {"capture_layer_ids": self.draft.config.target_layer_ids}
+            )
+            output = self.lm(ids, cache=[cache], logits_to_keep=keep, **kwargs)
+            if capture:
+                hidden = mx.concatenate(output.hidden_states, axis=-1)
+                mx.eval(hidden)
+                if speculate:
+                    self.verification[keys] = (cache, generation, hidden)
+                else:
+                    for index, (key, length) in enumerate(zip(keys, lengths, strict=True)):
+                        if key not in draft_keys:
+                            continue
+                        self.draft_hidden.setdefault(key, []).append(
+                            hidden[index : index + 1, width - length :]
+                        )
+            if keep != 0:
+                logits = output.logits if speculate else output.logits[:, -1, :]
                 mx.eval(logits)
                 results.update(zip(keys, logits, strict=True))
         for key, prefix in message.get("save", {}).items():
@@ -262,7 +348,7 @@ def follow():
                         stream,
                         {
                             "status": "ready",
-                            "protocol": 3,
+                            "protocol": 4,
                             "signature": model.runtime_signature,
                             "prefix_enabled": model.prefix_enabled,
                             "features": model.runtime_features,
@@ -283,6 +369,16 @@ def follow():
                             send(stream, "ok")
                         elif operation == "snapshot":
                             model.snapshot_requests(command["prefixes"])
+                            send(stream, "ok")
+                        elif operation == "draft":
+                            send(
+                                stream,
+                                model.draft_requests(
+                                    command["requests"], command["discard"]
+                                ),
+                            )
+                        elif operation == "commit":
+                            model.commit_verification(command["lengths"])
                             send(stream, "ok")
                         else:
                             raise ValueError(f"Unknown peer operation: {operation}")
