@@ -145,6 +145,8 @@ def test_restored_model_cache_matches_fresh_decode_after_batch_changes(tmp_path,
     _prepare_deepseek_v41_distributed(model, mx.float32)
     shard = Shard.__new__(Shard)
     shard.lm, shard.caches, shard.packed = model, {}, {}
+    shard.draft = None
+    shard.draft_caches, shard.draft_hidden, shard.verification = {}, {}, {}
     shard.group = SimpleNamespace(rank=lambda: 0)
     shard.prefix_store = PrefixStore(
         tmp_path,

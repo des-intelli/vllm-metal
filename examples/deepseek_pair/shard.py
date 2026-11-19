@@ -310,7 +310,9 @@ class Shard:
                 if speculate:
                     self.verification[keys] = (cache, generation, hidden)
                 else:
-                    for index, (key, length) in enumerate(zip(keys, lengths, strict=True)):
+                    for index, (key, length) in enumerate(
+                        zip(keys, lengths, strict=True)
+                    ):
                         if key not in draft_keys:
                             continue
                         self.draft_hidden.setdefault(key, []).append(
