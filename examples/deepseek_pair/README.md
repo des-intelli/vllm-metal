@@ -131,8 +131,9 @@ With a positive draft width, two additional options are available on both ranks:
 
 - `DEEPSEEK_DSPARK_BATCH=1` groups equal-width proposals into one drafter
   forward pass, with independent request positions and rotating KV caches.
-- `DEEPSEEK_DSPARK_ADAPTIVE=1` explores ordinary decode, up to two draft
-  tokens, and the configured maximum. It tracks elapsed time per emitted token
+- `DEEPSEEK_DSPARK_ADAPTIVE=1` explores ordinary decode, one draft token,
+  two draft tokens, and the configured maximum, capped by the server limit.
+  It tracks elapsed time per emitted token
   for each active batch size and periodically samples the other widths.
   Inspect `dspark_policy_sample` events for width, elapsed time and emitted
   tokens. Paused drafts retain the latest target hidden window for resumption.

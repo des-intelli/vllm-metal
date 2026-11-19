@@ -51,14 +51,19 @@ class TestWorkerVerification(unittest.TestCase):
 
     def test_adaptive_draft_width_uses_observed_cost_per_emitted_token(self):
         policy = DraftWidthPolicy(5)
-        for batch, best, costs in ((8, 0, (0.1, 0.32, 0.6)), (1, 5, (0.05, 0.08, 0.1))):
+        emitted_per_row = {0: 1, 1: 2, 2: 2, 5: 3}
+        for batch, best, costs in (
+            (8, 0, {0: 0.1, 1: 0.24, 2: 0.32, 5: 0.6}),
+            (4, 1, {0: 0.1, 1: 0.15, 2: 0.24, 5: 0.3}),
+            (1, 5, {0: 0.05, 1: 0.09, 2: 0.08, 5: 0.1}),
+        ):
             chosen = []
             for _ in range(60):
                 width = policy.choose(batch)
-                emitted = {0: 1, 2: 2, 5: 3}[width] * batch
-                policy.observe(batch, width, costs[(0, 2, 5).index(width)], emitted)
+                emitted = emitted_per_row[width] * batch
+                policy.observe(batch, width, costs[width], emitted)
                 chosen.append(width)
-            self.assertEqual(set(chosen), {0, 2, 5})
+            self.assertEqual(set(chosen), set(costs))
             self.assertEqual(chosen[-10:], [best] * 10)
         # Reconsider all modes when a formerly expensive verification width
         # starts emitting more tokens at a lower cost.
@@ -67,8 +72,8 @@ class TestWorkerVerification(unittest.TestCase):
             policy.observe(
                 8,
                 width,
-                {0: 0.2, 2: 0.06, 5: 0.6}[width],
-                8 * {0: 1, 2: 2, 5: 3}[width],
+                {0: 0.2, 1: 0.18, 2: 0.06, 5: 0.6}[width],
+                8 * emitted_per_row[width],
             )
         self.assertEqual(policy.choose(8), 2)
 
@@ -76,6 +81,7 @@ class TestWorkerVerification(unittest.TestCase):
         policy = DraftWidthPolicy(5)
         for accepted_output in (1, 3, 1, 3):
             policy.observe(1, 0, 0.12, 1)
+            policy.observe(1, 1, 0.16, 1)
             policy.observe(1, 2, 0.20, accepted_output)
             policy.observe(1, 5, 0.60, 3)
         # Width two emits eight tokens in 0.8 seconds, ahead of ordinary

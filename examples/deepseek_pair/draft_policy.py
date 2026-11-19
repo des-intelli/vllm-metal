@@ -17,7 +17,7 @@ class _Cost:
 
 class DraftWidthPolicy:
     def __init__(self, limit):
-        self.widths = tuple(sorted({0, min(2, limit), limit}))
+        self.widths = tuple(sorted({0, min(1, limit), min(2, limit), limit}))
         self.costs = {}
         self.steps = {}
 
