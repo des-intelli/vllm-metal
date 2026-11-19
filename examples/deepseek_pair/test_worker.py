@@ -5,7 +5,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import mlx.core as mx
+import numpy as np
 import torch
+from sharded_sampling import merge_candidates, shard_candidates
 from studio_worker import StudioWorker
 from vllm.sampling_params import SamplingParams
 
@@ -33,6 +35,7 @@ class TestWorkerVerification(unittest.TestCase):
             for key, value in params.items()
         }
         worker.control = None
+        worker.candidate_k = None
         worker.sampler = Sampler()
         worker.shard = SimpleNamespace(commit_verification=Mock(), _prefix_event=Mock())
         worker._snapshot_requests = Mock()
@@ -127,6 +130,42 @@ class TestWorkerVerification(unittest.TestCase):
                 )
             )
         )
+
+    def test_compact_shards_match_full_greedy_tokens_probabilities_and_tie_ranks(self):
+        logits = mx.array(
+            [
+                [0.0, -3.0, 5.0, 2.0, 4.0, -1.0, 1.0, 7.0],
+                [1000.0, 1002.0, 1008.0, 1003.0, 1005.0, 1008.0, 1008.0, 1001.0],
+            ]
+        )
+        for k in (-1, 0, 1, 3):
+            with self.subTest(k=k):
+                p = SamplingParams(temperature=0, logprobs=None if k < 0 else k)
+                worker = self.worker({"r": p})
+                self.assertEqual(worker._candidate_width(["r"]), k)
+                batch = SamplingBatch([p, p], [[], []], [[], []], vocab_size=8)
+                full = sample_from_logits(logits, batch, worker.sampler)
+                packets = mx.stack(
+                    [
+                        shard_candidates(row, rank, k)
+                        for rank, row in enumerate(mx.split(logits, 2, axis=-1))
+                    ],
+                    axis=-2,
+                )
+                ids, fields = merge_candidates(packets, k)
+                self.assertEqual(ids, full.token_ids)
+                if k < 0:
+                    self.assertIsNone(fields)
+                    continue
+                ids_table, probabilities, ranks = fields
+                np.testing.assert_allclose(
+                    probabilities, full.logprobs.logprobs, atol=1e-6
+                )
+                np.testing.assert_array_equal(ranks, full.logprobs.sampled_token_ranks)
+                np.testing.assert_array_equal(
+                    ids_table[0], full.logprobs.logprob_token_ids[0]
+                )
+                np.testing.assert_array_equal(ids_table[:, 0], ids)
 
 
 if __name__ == "__main__":
