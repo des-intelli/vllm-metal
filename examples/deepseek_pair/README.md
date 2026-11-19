@@ -83,7 +83,7 @@ snapshots. Both options require `DEEPSEEK_PREFIX_CACHE=1`.
 The existing RAM and SSD budgets bound these additional snapshots. SSD writes
 remain synchronous, so measure their cost against follow-up TTFT and avoid
 overly frequent checkpoints. Checkpoints share the existing LRU with prompts.
-Both ranks negotiate the same feature configuration at startup (protocol 4).
+Both ranks negotiate the same feature configuration at startup (protocol 5).
 
 Run snapshot, disk, branch-isolation and continuation tests against the matching
 MLX VLM source checkout with:
@@ -124,9 +124,20 @@ Target prefix snapshots remain enabled. Draft caches are request-local and
 discarded when a request finishes; restored target snapshots do not include
 draft hidden states. The drafter uses the newly evaluated suffix in that case,
 so measure acceptance on cache-hit workloads separately. All emitted tokens
-still pass the target verifier. Drafting runs per request; target verification
-groups requests with equal scheduled block widths. Batch throughput therefore
-needs measurement independently of single-request speedup.
+still pass the target verifier. Target verification groups requests with equal
+scheduled block widths.
+
+With a positive draft width, two additional options are available on both ranks:
+
+- `DEEPSEEK_DSPARK_BATCH=1` groups equal-width proposals into one drafter
+  forward pass, with independent request positions and rotating KV caches.
+- `DEEPSEEK_DSPARK_ADAPTIVE=1` explores ordinary decode, up to two draft
+  tokens, and the configured maximum. It tracks elapsed time per emitted token
+  for each active batch size and periodically samples the other widths.
+  Inspect `dspark_policy_sample` events for width, elapsed time and emitted
+  tokens. Paused drafts retain the latest target hidden window for resumption.
+
+Both options default to off and can be enabled independently.
 
 Run the worker's fixed-logit acceptance, stop, logprobs, and mixed-sampling
 regressions in the serving Python environment without loading model weights:

@@ -22,6 +22,26 @@ def key(offset=8):
     return hashlib.sha256(str(offset).encode()).hexdigest(), offset
 
 
+def test_deferring_drafts_keeps_window_and_absolute_position():
+    from types import SimpleNamespace
+
+    from shard import Shard
+
+    shard = Shard.__new__(Shard)
+    shard.draft = SimpleNamespace(args=SimpleNamespace(sliding_window=4))
+    shard.draft_caches = {"r": [SimpleNamespace(offset=8, dspark_start_position=9)]}
+    shard.draft_start_positions = {}
+    shard.draft_hidden = {"r": [mx.arange(9).reshape(1, 9, 1)]}
+    shard._defer_draft("r")
+    assert shard.draft_start_positions["r"] == 22 and not shard.draft_caches
+    assert shard.draft_hidden["r"][0].reshape(-1).tolist() == [5, 6, 7, 8]
+    shard.draft_hidden["r"].append(mx.arange(9, 13).reshape(1, 4, 1))
+    shard._defer_draft("r")
+    assert shard.draft_start_positions["r"] == 26
+    assert len(shard.draft_hidden["r"]) == 1
+    assert shard.draft_hidden["r"][0].reshape(-1).tolist() == [9, 10, 11, 12]
+
+
 @pytest.mark.parametrize("disk", [False, True])
 def test_snapshot_branches_do_not_mutate_one_another(tmp_path, disk):
     store = PrefixStore(
@@ -147,6 +167,7 @@ def test_restored_model_cache_matches_fresh_decode_after_batch_changes(tmp_path,
     shard.lm, shard.caches, shard.packed = model, {}, {}
     shard.draft = None
     shard.draft_caches, shard.draft_hidden, shard.verification = {}, {}, {}
+    shard.draft_start_positions = {}
     shard.group = SimpleNamespace(rank=lambda: 0)
     shard.prefix_store = PrefixStore(
         tmp_path,

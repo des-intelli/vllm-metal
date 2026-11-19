@@ -103,11 +103,18 @@ class Shard:
         self.caches = {}
         self.packed = {}
         self.dspark_width = int(os.environ.get("DEEPSEEK_DSPARK_TOKENS", "0"))
+        self.batch_drafts = os.environ.get("DEEPSEEK_DSPARK_BATCH", "0") == "1"
+        self.adaptive_drafts = os.environ.get("DEEPSEEK_DSPARK_ADAPTIVE", "0") == "1"
         if not 0 <= self.dspark_width <= 16:
             raise ValueError("DEEPSEEK_DSPARK_TOKENS must be between zero and 16")
+        if (self.batch_drafts or self.adaptive_drafts) and not self.dspark_width:
+            raise ValueError(
+                "Batched and adaptive DSpark require a positive draft width"
+            )
         self.draft = None
         self.draft_caches = {}
         self.draft_hidden = {}
+        self.draft_start_positions = {}
         self.verification = {}
         if self.dspark_width:
             from mlx_vlm.speculative.drafters.deepseek_v41_dspark.split import (
@@ -116,9 +123,17 @@ class Shard:
 
             self.draft = DeepseekV41DsparkSplitter().load(MODEL)
             self.draft.bind(self.lm)
+            if (self.batch_drafts or self.adaptive_drafts) and not callable(
+                getattr(self.draft, "draft_batch_greedy", None)
+            ):
+                raise RuntimeError(
+                    "The selected model package does not support adaptive or batched DSpark"
+                )
             mx.eval(self.draft.parameters())
         source = Path(inspect.getfile(type(self.lm))).parent
         signature = hashlib.sha256()
+        if self.draft is not None:
+            signature.update(Path(inspect.getfile(type(self.draft))).read_bytes())
         for path in [
             *(
                 source / name
@@ -136,6 +151,7 @@ class Shard:
                     "studio_worker.py",
                     "prefix_cache.py",
                     "sharded_sampling.py",
+                    "draft_policy.py",
                 )
             ),
         ]:
@@ -152,6 +168,8 @@ class Shard:
             "decode_end": self.prefix_decode_end,
             "stride": self.prefix_stride,
             "dspark_tokens": self.dspark_width,
+            "batch_drafts": self.batch_drafts,
+            "adaptive_drafts": self.adaptive_drafts,
             "sharded_greedy": self.sharded_greedy,
         }
         self.prefix_store = None
@@ -191,27 +209,64 @@ class Shard:
             self.caches.pop(key, None)
             self.draft_caches.pop(key, None)
             self.draft_hidden.pop(key, None)
+            self.draft_start_positions.pop(key, None)
 
-    def draft_requests(self, requests, discard=()):
+    def _defer_draft(self, key):
+        parts = self.draft_hidden[key]
+        window = self.draft.args.sliding_window
+        skipped = sum(h.shape[1] for h in parts) - window
+        if skipped <= 0:
+            return
+        # Once a complete new window is available the old rotating KV can be
+        # rebuilt from it. Preserve its absolute RoPE coordinates across pauses.
+        old = self.draft_caches.pop(key, None)
+        start = self.draft_start_positions.get(key, 0)
+        if old is not None:
+            start = old[0].dspark_start_position + old[0].offset
+        self.draft_start_positions[key] = start + skipped
+        while skipped >= parts[0].shape[1]:
+            skipped -= parts.pop(0).shape[1]
+        if skipped:
+            parts[0] = mx.take(parts[0], mx.arange(skipped, parts[0].shape[1]), axis=1)
+            mx.eval(parts[0])
+
+    def draft_requests(self, requests, discard=(), defer=()):
         if self.draft is None:
             raise RuntimeError("DSpark is not enabled")
         result = {}
         for key in discard:
             self.draft_hidden.pop(key, None)
+        for key in defer:
+            self._defer_draft(key)
+        by_width = defaultdict(list)
         for key, anchor, width in requests:
             if not 0 < width <= self.dspark_width:
                 raise ValueError("Draft width exceeds the configured maximum")
             hidden = mx.concatenate(self.draft_hidden.pop(key), axis=1)
             if key not in self.draft_caches:
-                self.draft_caches[key] = self.draft.make_cache()
-            proposals = self.draft.draft_block(
-                anchor,
-                hidden,
-                self.draft_caches[key],
-                width + 1,
-                lambda logits: mx.argmax(logits, axis=-1),
-            )
-            result[key] = proposals.tolist()[0]
+                position = self.draft_start_positions.pop(key, 0)
+                self.draft_caches[key] = (
+                    self.draft.make_cache(start_position=position)
+                    if position
+                    else self.draft.make_cache()
+                )
+            by_width[width].append((key, anchor, hidden, self.draft_caches[key]))
+
+        def greedy(logits):
+            return mx.argmax(logits, axis=-1)
+
+        for width, rows in by_width.items():
+            if self.batch_drafts and len(rows) > 1:
+                keys, anchors, hidden, caches = zip(*rows, strict=True)
+                proposals = self.draft.draft_batch_greedy(
+                    anchors, hidden, caches, width + 1, greedy
+                )
+                result.update(zip(keys, proposals.tolist(), strict=True))
+            else:
+                for key, anchor, hidden, cache in rows:
+                    result[key] = self.draft.draft_block(
+                        anchor, hidden, cache, width + 1, greedy
+                    ).tolist()[0]
         return result
 
     def commit_verification(self, lengths):
@@ -284,6 +339,7 @@ class Shard:
             self.caches.pop(key, None)
             self.draft_caches.pop(key, None)
             self.draft_hidden.pop(key, None)
+            self.draft_start_positions.pop(key, None)
         results = {}
         for batch in batches:
             keys = tuple(key for key, _ in batch)
@@ -384,7 +440,7 @@ def follow():
                         stream,
                         {
                             "status": "ready",
-                            "protocol": 4,
+                            "protocol": 5,
                             "signature": model.runtime_signature,
                             "prefix_enabled": model.prefix_enabled,
                             "features": model.runtime_features,
@@ -410,7 +466,9 @@ def follow():
                             send(
                                 stream,
                                 model.draft_requests(
-                                    command["requests"], command["discard"]
+                                    command["requests"],
+                                    command["discard"],
+                                    command["defer"],
                                 ),
                             )
                         elif operation == "commit":
