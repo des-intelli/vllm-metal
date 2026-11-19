@@ -1,0 +1,49 @@
+name: DeepSeek pair snapshots
+
+on:
+  pull_request:
+    paths:
+      - 'examples/deepseek_pair/**'
+      - '.github/workflows/deepseek-pair.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'examples/deepseek_pair/**'
+      - '.github/workflows/deepseek-pair.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  snapshots:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          activate-environment: true
+      - uses: actions/checkout@v4
+        with:
+          repository: des-intelli/mlx-vlm
+          ref: 17e1627307f76589858319160a17a692fca381ad
+          path: .model-source
+      - name: Install the matching model implementation
+        run: >-
+          uv pip install
+          'mlx==0.32.4' 'mlx-lm==0.32.2' pytest pytest-asyncio
+          -e .model-source
+      - name: Check snapshot isolation, budgets and continuation
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          import pytest
+          if not mx.metal.is_available():
+              mx.set_default_device(mx.cpu)
+          raise SystemExit(pytest.main(['-q', 'examples/deepseek_pair/test_prefix_cache.py']))
+          PY
