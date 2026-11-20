@@ -7,6 +7,7 @@ import time
 import mlx.core as mx
 import numpy as np
 import torch
+from draft_policy import DraftWidthPolicy
 from prefix_cache import prefix_keys, request_snapshots
 from shard import ROOT, Shard, receive, send, watch_peer
 from sharded_sampling import merge_candidates
@@ -47,7 +48,7 @@ class StudioWorker(MetalWorker):
         self.shard = Shard()
         expected = {
             "status": "ready",
-            "protocol": 4,
+            "protocol": 5,
             "signature": self.shard.runtime_signature,
             "prefix_enabled": self.shard.prefix_enabled,
             "features": self.shard.runtime_features,
@@ -58,6 +59,13 @@ class StudioWorker(MetalWorker):
         self.sampler = Sampler()
         self.pending = None
         self.candidate_k = None
+        self.draft_policy = (
+            DraftWidthPolicy(self.shard.dspark_width)
+            if self.shard.adaptive_drafts
+            else None
+        )
+        self.last_draft = None
+        self.policy_sample = None
         self.draft_token_ids = None
         spec = self.vllm_config.speculative_config
         if self.shard.dspark_width:
@@ -181,6 +189,21 @@ class StudioWorker(MetalWorker):
         return CompilationTimes(language_model=time.monotonic() - start, encoder=0)
 
     def execute_model(self, scheduler_output):
+        self.policy_sample = None
+        if self.draft_policy is not None and self.last_draft is not None:
+            cohort, width, draft_seconds = self.last_draft
+            counts = scheduler_output.num_scheduled_tokens
+            scheduled = scheduler_output.scheduled_spec_decode_tokens
+            if cohort == counts.keys() and all(
+                n == width + 1 and len(scheduled.get(k, [])) == width
+                for k, n in counts.items()
+            ):
+                self.policy_sample = (
+                    len(counts),
+                    width,
+                    time.perf_counter(),
+                    draft_seconds,
+                )
         drop = set(scheduler_output.finished_req_ids)
         # Cache offset excludes the last sampled token, which has not been
         # evaluated. Save that exact processed prefix on completion or cancel.
@@ -309,6 +332,7 @@ class StudioWorker(MetalWorker):
         if logprobs is not None and len(sample) != len(keys):
             offsets = list(np.cumsum([0] + [len(row) for row in tokens]))
             logprobs = logprobs._replace(cu_num_generated_tokens=offsets)
+        self._observe_draft_cost(tokens)
         self._propose_drafts(sample)
         return ModelRunnerOutput(
             req_ids=keys,
@@ -379,7 +403,7 @@ class StudioWorker(MetalWorker):
         self.draft_token_ids = None
         if not self.shard.dspark_width:
             return
-        requests, discard = [], []
+        eligible, discard = [], []
         for key in keys:
             state = self.states[key]
             params = state["params"]
@@ -394,18 +418,54 @@ class StudioWorker(MetalWorker):
             )
             width = min(self.shard.dspark_width, remaining - 1)
             if width > 0:
-                requests.append((key, state["output"][-1], width))
+                eligible.append((key, state["output"][-1], width))
             else:
                 discard.append(key)
         # Empty requests are sent too, keeping both ranks on the same protocol.
-        send(self.control, {"op": "draft", "requests": requests, "discard": discard})
-        proposals = self.shard.draft_requests(requests, discard)
+        width = self.shard.dspark_width
+        if eligible and self.draft_policy is not None:
+            width = self.draft_policy.choose(len(eligible))
+        defer = [key for key, _, _ in eligible] if width == 0 else []
+        requests = (
+            [(key, anchor, min(width, limit)) for key, anchor, limit in eligible]
+            if width
+            else []
+        )
+        start = time.perf_counter()
+        send(
+            self.control,
+            {"op": "draft", "requests": requests, "discard": discard, "defer": defer},
+        )
+        proposals = self.shard.draft_requests(requests, discard, defer)
         if receive(self.control) != proposals:
             raise RuntimeError("DSpark ranks produced different drafts")
+        if self.draft_policy is not None:
+            self.last_draft = None
+            if eligible and all(limit >= width for _, _, limit in eligible):
+                self.last_draft = (
+                    {key for key, _, _ in eligible},
+                    width,
+                    time.perf_counter() - start,
+                )
         if proposals:
             self.draft_token_ids = DraftTokenIds(
                 list(proposals), list(proposals.values())
             )
+
+    def _observe_draft_cost(self, generated):
+        if self.policy_sample is not None:
+            batch, width, start, draft_seconds = self.policy_sample
+            elapsed = time.perf_counter() - start + draft_seconds
+            emitted = sum(map(len, generated))
+            self.draft_policy.observe(batch, width, elapsed, emitted)
+            self.shard._prefix_event(
+                "dspark_policy_sample",
+                requests=batch,
+                width=width,
+                elapsed_s=elapsed,
+                emitted=emitted,
+            )
+            self.policy_sample = None
 
     def take_draft_token_ids(self):
         result, self.draft_token_ids = self.draft_token_ids, None
@@ -508,6 +568,7 @@ class StudioWorker(MetalWorker):
                 list(np.cumsum([0] + [len(row) for row in generated])),
             )
         draft_start = time.perf_counter()
+        self._observe_draft_cost(generated)
         self._propose_drafts(list(spans))
         self.shard._prefix_event(
             "dspark_step",

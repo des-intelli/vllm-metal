@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 import mlx.core as mx
 import numpy as np
 import torch
+from draft_policy import DraftWidthPolicy
 from sharded_sampling import merge_candidates, shard_candidates
 from studio_worker import StudioWorker
 from vllm.sampling_params import SamplingParams
@@ -22,6 +23,71 @@ def scores(*tokens):
 
 
 class TestWorkerVerification(unittest.TestCase):
+    @patch("studio_worker.send")
+    @patch("studio_worker.receive")
+    def test_adaptive_pause_and_resume_respects_remaining_budget(self, receive, send):
+        worker = self.worker(
+            {
+                "a": SamplingParams(temperature=0, max_tokens=10),
+                "b": SamplingParams(temperature=0, max_tokens=3),
+            }
+        )
+        worker.model_config = SimpleNamespace(max_model_len=100)
+        worker.shard.dspark_width = 5
+        worker.draft_policy = Mock()
+        worker.draft_policy.choose.side_effect = [0, 5]
+        worker.shard.draft_requests = Mock(side_effect=[{}, {"a": [4] * 5, "b": [4]}])
+        receive.side_effect = [{}, {"a": [4] * 5, "b": [4]}]
+        StudioWorker._propose_drafts(worker, ["a", "b"])
+        self.assertIsNone(worker.draft_token_ids)
+        worker.shard.draft_requests.assert_called_with([], [], ["a", "b"])
+        self.assertEqual(worker.last_draft[:2], ({"a", "b"}, 0))
+        StudioWorker._propose_drafts(worker, ["a", "b"])
+        worker.shard.draft_requests.assert_called_with(
+            [("a", 7, 5), ("b", 7, 1)], [], []
+        )
+        self.assertEqual(worker.draft_token_ids.draft_token_ids, [[4] * 5, [4]])
+        self.assertIsNone(worker.last_draft)
+
+    def test_adaptive_draft_width_uses_observed_cost_per_emitted_token(self):
+        policy = DraftWidthPolicy(5)
+        emitted_per_row = {0: 1, 1: 2, 2: 2, 5: 3}
+        for batch, best, costs in (
+            (8, 0, {0: 0.1, 1: 0.24, 2: 0.32, 5: 0.6}),
+            (4, 1, {0: 0.1, 1: 0.15, 2: 0.24, 5: 0.3}),
+            (1, 5, {0: 0.05, 1: 0.09, 2: 0.08, 5: 0.1}),
+        ):
+            chosen = []
+            for _ in range(60):
+                width = policy.choose(batch)
+                emitted = emitted_per_row[width] * batch
+                policy.observe(batch, width, costs[width], emitted)
+                chosen.append(width)
+            self.assertEqual(set(chosen), set(costs))
+            self.assertEqual(chosen[-10:], [best] * 10)
+        # Reconsider all modes when a formerly expensive verification width
+        # starts emitting more tokens at a lower cost.
+        for _ in range(1400):
+            width = policy.choose(8)
+            policy.observe(
+                8,
+                width,
+                {0: 0.2, 1: 0.18, 2: 0.06, 5: 0.6}[width],
+                8 * emitted_per_row[width],
+            )
+        self.assertEqual(policy.choose(8), 2)
+
+    def test_adaptive_width_maximizes_tokens_over_elapsed_time(self):
+        policy = DraftWidthPolicy(5)
+        for accepted_output in (1, 3, 1, 3):
+            policy.observe(1, 0, 0.12, 1)
+            policy.observe(1, 1, 0.16, 1)
+            policy.observe(1, 2, 0.20, accepted_output)
+            policy.observe(1, 5, 0.60, 3)
+        # Width two emits eight tokens in 0.8 seconds, ahead of ordinary
+        # decoding at one token per 0.12 seconds despite two rejected drafts.
+        self.assertEqual(policy.choose(1), 2)
+
     def worker(self, params):
         worker = object.__new__(StudioWorker)
         worker.states = {
@@ -36,6 +102,8 @@ class TestWorkerVerification(unittest.TestCase):
         }
         worker.control = None
         worker.candidate_k = None
+        worker.policy_sample = None
+        worker.draft_policy = None
         worker.sampler = Sampler()
         worker.shard = SimpleNamespace(commit_verification=Mock(), _prefix_event=Mock())
         worker._snapshot_requests = Mock()
