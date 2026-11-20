@@ -149,6 +149,32 @@ class TestWorkerVerification(unittest.TestCase):
 
     @patch("studio_worker.receive", return_value="ok")
     @patch("studio_worker.send")
+    def test_compact_verification_with_an_ordinary_row(self, send, receive):
+        params = SamplingParams(temperature=0, max_tokens=16384, logprobs=0)
+        worker = self.worker({"spec": params, "normal": params})
+        worker.candidate_k = 0
+        logits = scores(1, 5, 6, 9)
+        packets = mx.stack(
+            [
+                shard_candidates(shard, rank, 0)
+                for rank, shard in enumerate(mx.split(logits, 2, axis=-1))
+            ],
+            axis=-2,
+        )
+        result = worker._sample_verification(
+            ["spec", "normal"],
+            ["normal"],
+            {"normal": packets[-1]},
+            {"spec": packets[:3]},
+            {"spec": [1, 2]},
+            None,
+        )
+        self.assertEqual(result.sampled_token_ids, [[1, 5], [9]])
+        self.assertEqual(result.logprobs.cu_num_generated_tokens, [0, 2, 3])
+        self.assertEqual(result.logprobs.logprob_token_ids[:, 0].tolist(), [1, 5, 9])
+
+    @patch("studio_worker.receive", return_value="ok")
+    @patch("studio_worker.send")
     def test_mixed_random_request_preserves_rng_and_partial_prefill(
         self, send, receive
     ):
