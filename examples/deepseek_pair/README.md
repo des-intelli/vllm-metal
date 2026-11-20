@@ -92,6 +92,17 @@ MLX VLM source checkout with:
 python -m pytest -q examples/deepseek_pair/test_prefix_cache.py
 ```
 
+## Distributed greedy sampling
+
+Set `DEEPSEEK_SHARDED_GREEDY=1` on both ranks to reduce vocabulary traffic
+for plain greedy requests. Each rank projects its original FP32 vocabulary
+shard and exchanges its best candidate. When the client requests up to five
+top logprobs the ranks also exchange normalization statistics and top candidates.
+The option covers ordinary decode and DSpark target verification. A batch with
+random sampling, grammar constraints, penalties, or unsupported logprob options
+uses the existing full-vocabulary sampler. The default is off. The service logs
+the candidate and full-logit byte counts once per shape for comparison.
+
 ## DSpark greedy serving
 
 Set `DEEPSEEK_DSPARK_TOKENS=5` on both ranks and add

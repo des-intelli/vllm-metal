@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from prefix_cache import prefix_keys, request_snapshots
 from shard import ROOT, Shard, receive, send, watch_peer
+from sharded_sampling import merge_candidates
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import DraftTokenIds, LogprobsLists, ModelRunnerOutput
 
@@ -56,6 +57,7 @@ class StudioWorker(MetalWorker):
         self.states = {}
         self.sampler = Sampler()
         self.pending = None
+        self.candidate_k = None
         self.draft_token_ids = None
         spec = self.vllm_config.speculative_config
         if self.shard.dspark_width:
@@ -104,6 +106,7 @@ class StudioWorker(MetalWorker):
             "sample": [key for key, _ in jobs] if sample is None else sample,
             "save": {} if save is None else save,
             "speculate": speculate,
+            "candidate_k": self.candidate_k,
             "draft_keys": [
                 key
                 for key, _ in jobs
@@ -210,6 +213,9 @@ class StudioWorker(MetalWorker):
         jobs, tails, sample, save, verify = [], [], [], {}, []
         scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
         keys = list(scheduler_output.num_scheduled_tokens)
+        self.candidate_k = (
+            self._candidate_width(keys) if self.shard.sharded_greedy else None
+        )
         for key, count in scheduler_output.num_scheduled_tokens.items():
             state = self.states[key]
             pos = state["pos"]
@@ -286,20 +292,18 @@ class StudioWorker(MetalWorker):
                         scores[i] = mx.where(
                             mx.array(bits.astype(bool)), scores[i], -float("inf")
                         )
-            batch = SamplingBatch(
+            token_ids, logprobs = self._sample_rows(
+                scores,
                 [s["params"] for s in states],
                 [s["prompt"] for s in states],
                 [s["output"] for s in states],
-                vocab_size=scores.shape[-1],
                 generators={
                     i: s["generator"]
                     for i, s in enumerate(states)
                     if s["generator"] is not None
                 },
             )
-            result = sample_from_logits(scores, batch, self.sampler)
-            logprobs = result.logprobs
-            for key, token in zip(sample, result.token_ids, strict=True):
+            for key, token in zip(sample, token_ids, strict=True):
                 self.states[key]["output"].append(token)
                 tokens[rows[key]] = [token]
         if logprobs is not None and len(sample) != len(keys):
@@ -312,6 +316,44 @@ class StudioWorker(MetalWorker):
             sampled_token_ids=tokens,
             logprobs=logprobs,
         )
+
+    def _candidate_width(self, keys):
+        """Use one representation for every normal and verification row in this step."""
+        width = -1
+        for key in keys:
+            state = self.states[key]
+            p = state["params"]
+            if (
+                p.temperature >= 1e-5
+                or p.structured_outputs is not None
+                or p.top_k > 0
+                or p.top_p != 1.0
+                or p.frequency_penalty
+                or p.presence_penalty
+                or p.repetition_penalty != 1.0
+                or p.min_tokens > len(state["output"])
+                or p.allowed_token_ids
+                or p.bad_words_token_ids
+                or p.logit_bias
+                or p.logprob_token_ids
+                or p.prompt_logprobs is not None
+            ):
+                return None
+            if p.num_logprobs is not None:
+                if not 0 <= p.num_logprobs <= 5:
+                    return None
+                width = max(width, p.num_logprobs)
+        return width
+
+    def _sample_rows(self, scores, params, prompts, outputs, generators):
+        if self.candidate_k is not None:
+            ids, fields = merge_candidates(scores, self.candidate_k)
+            return ids, None if fields is None else LogprobsLists(*fields, None)
+        batch = SamplingBatch(
+            params, prompts, outputs, vocab_size=scores.shape[-1], generators=generators
+        )
+        result = sample_from_logits(scores, batch, self.sampler)
+        return result.token_ids, result.logprobs
 
     @staticmethod
     def _can_draft(params):
@@ -401,25 +443,19 @@ class StudioWorker(MetalWorker):
                     continue
                 values = logits[key][None]
             start = len(flat)
-            for index, value in enumerate(values):
-                if key not in verified and state["generator"] is not None:
-                    generators[len(flat)] = state["generator"]
-                flat.append(value)
-                params.append(state["params"])
-                prompts.append(state["prompt"])
-                outputs.append(state["output"] + list(drafts.get(key, []))[:index])
+            flat.extend(values)
+            # Rank-local candidates already include everything required for greedy sampling.
+            if self.candidate_k is None:
+                for index in range(len(values)):
+                    if key not in verified and state["generator"] is not None:
+                        generators[start + index] = state["generator"]
+                    params.append(state["params"])
+                    prompts.append(state["prompt"])
+                    outputs.append(state["output"] + list(drafts.get(key, []))[:index])
             spans[key] = (start, len(flat))
         scores = mx.stack(flat)
-        result = sample_from_logits(
-            scores,
-            SamplingBatch(
-                params,
-                prompts,
-                outputs,
-                vocab_size=scores.shape[-1],
-                generators=generators,
-            ),
-            self.sampler,
+        token_ids, logprobs = self._sample_rows(
+            scores, params, prompts, outputs, generators
         )
         generated, lengths, selected = [], {}, []
         for key in keys:
@@ -427,7 +463,7 @@ class StudioWorker(MetalWorker):
                 generated.append([])
                 continue
             start, end = spans[key]
-            choices = result.token_ids[start:end]
+            choices = token_ids[start:end]
             if key in verified:
                 accepted = 0
                 for proposal, target in zip(drafts[key], choices, strict=False):
@@ -464,7 +500,6 @@ class StudioWorker(MetalWorker):
             raise RuntimeError("Peer did not commit verification")
         self._snapshot_requests(list(lengths))
         commit_seconds = time.perf_counter() - commit_start
-        logprobs = result.logprobs
         if logprobs is not None:
             logprobs = LogprobsLists(
                 logprobs.logprob_token_ids[selected],

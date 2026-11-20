@@ -12,6 +12,7 @@ from pathlib import Path
 
 import mlx.core as mx
 from prefix_cache import PrefixStore, model_identity
+from sharded_sampling import gather_candidates
 
 ROOT = Path(os.environ.get("DEEPSEEK_CLUSTER_ROOT", Path.home() / "vllm-cluster"))
 MODEL = Path(
@@ -92,6 +93,10 @@ class Shard:
         mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
         model, _ = sharded_load(str(MODEL), tensor_group=self.group)
         self.lm = model.language_model
+        self.sharded_greedy = os.environ.get("DEEPSEEK_SHARDED_GREEDY", "0") == "1"
+        self.candidate_shapes = set()
+        if self.sharded_greedy and self.lm.head.sharding_group is None:
+            raise ValueError("Sharded greedy requires a partitioned vocabulary")
         self.lm._ensure_engram_hash()
         if self.lm.engram_hash is None:
             raise RuntimeError("Engram hash initialization failed")
@@ -126,7 +131,12 @@ class Shard:
             ),
             *(
                 Path(__file__).with_name(name)
-                for name in ("shard.py", "studio_worker.py", "prefix_cache.py")
+                for name in (
+                    "shard.py",
+                    "studio_worker.py",
+                    "prefix_cache.py",
+                    "sharded_sampling.py",
+                )
             ),
         ]:
             signature.update(path.read_bytes())
@@ -142,6 +152,7 @@ class Shard:
             "decode_end": self.prefix_decode_end,
             "stride": self.prefix_stride,
             "dspark_tokens": self.dspark_width,
+            "sharded_greedy": self.sharded_greedy,
         }
         self.prefix_store = None
         if self.prefix_enabled:
@@ -303,6 +314,9 @@ class Shard:
                 if not capture
                 else {"capture_layer_ids": self.draft.config.target_layer_ids}
             )
+            candidate_k = message.get("candidate_k")
+            if keep != 0 and candidate_k is not None:
+                kwargs["local_vocab"] = True
             output = self.lm(ids, cache=[cache], logits_to_keep=keep, **kwargs)
             if capture:
                 hidden = mx.concatenate(output.hidden_states, axis=-1)
@@ -320,6 +334,26 @@ class Shard:
                         )
             if keep != 0:
                 logits = output.logits if speculate else output.logits[:, -1, :]
+                if candidate_k is not None:
+                    if logits.shape[-1] != self.lm.head.weight.shape[0]:
+                        raise RuntimeError(
+                            "Expected rank-local logits from the language model"
+                        )
+                    candidates = gather_candidates(
+                        logits, self.lm.head.sharding_group, candidate_k
+                    )
+                    shape = (logits.shape, candidate_k)
+                    if shape not in self.candidate_shapes:
+                        self.candidate_shapes.add(shape)
+                        self._prefix_event(
+                            "sharded_greedy",
+                            local_shape=logits.shape,
+                            top_k=candidate_k,
+                            dense_bytes_per_rank=logits.nbytes,
+                            candidate_bytes_per_rank=candidates.nbytes
+                            // self.group.size(),
+                        )
+                    logits = candidates
                 mx.eval(logits)
                 results.update(zip(keys, logits, strict=True))
         for key, prefix in message.get("save", {}).items():
